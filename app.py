@@ -23,7 +23,7 @@ SPB_AREA_ID = "2"
 
 # ВАЖНО:
 # укажи свою реальную почту
-HH_USER_AGENT_EMAIL = "yourmail@gmail.com"
+HH_USER_AGENT_EMAIL = "Daron6030@mail.ru"
 
 HH_USER_AGENT = (
     f"salary-spb-monitor/1.0 "
