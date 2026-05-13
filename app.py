@@ -1,155 +1,269 @@
-import re
+import os
 import time
 from datetime import datetime
-from urllib.parse import quote_plus
 
 import pandas as pd
 import requests
 import streamlit as st
-from bs4 import BeautifulSoup
 
 
+# -------------------------------------------------
+# Настройки страницы
+# -------------------------------------------------
 st.set_page_config(
     page_title="Зарплаты HoReCa СПБ",
     layout="centered"
 )
 
+# -------------------------------------------------
+# HH API
+# -------------------------------------------------
+HH_API_URL = "https://api.hh.ru/vacancies"
 SPB_AREA_ID = "2"
 
+# ВАЖНО:
+# укажи свою реальную почту
+HH_USER_AGENT_EMAIL = "yourmail@gmail.com"
+
+HH_USER_AGENT = (
+    f"salary-spb-monitor/1.0 "
+    f"(contact: {HH_USER_AGENT_EMAIL})"
+)
+
+# -------------------------------------------------
+# Категории
+# -------------------------------------------------
 CATEGORIES = {
-    "Повар": ["повар", "повар ресторан", "повар кафе"],
-    "Официант": ["официант", "официант ресторан", "официант кафе"],
-    "Посудомойщица": ["посудомойщица", "мойщик посуды", "мойщица посуды"],
-    "Администратор": ["администратор ресторана", "администратор кафе", "менеджер ресторана"],
+    "Повар": [
+        "повар",
+        "повар ресторан",
+        "повар кафе",
+        "повар горячего цеха",
+        "повар холодного цеха",
+        "су-шеф",
+    ],
+
+    "Официант": [
+        "официант",
+        "официант ресторан",
+        "официант кафе",
+    ],
+
+    "Посудомойщица": [
+        "посудомойщица",
+        "мойщик посуды",
+        "мойщица посуды",
+        "кухонный работник",
+    ],
+
+    "Администратор": [
+        "администратор ресторана",
+        "администратор кафе",
+        "менеджер ресторана",
+        "менеджер кафе",
+    ],
 }
 
+# -------------------------------------------------
+# Удаляем локальные proxy windows/vpn
+# -------------------------------------------------
+for proxy_var in [
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+]:
+    os.environ.pop(proxy_var, None)
 
+
+# -------------------------------------------------
+# Форматирование денег
+# -------------------------------------------------
 def format_money(value):
+
     if value is None or pd.isna(value):
         return "—"
+
     return f"{int(round(value)):,}".replace(",", " ") + " ₽"
 
 
-def parse_salary_text(text):
-    if not text:
+# -------------------------------------------------
+# Нормализация зарплаты
+# -------------------------------------------------
+def normalize_salary(salary):
+
+    if not salary:
         return None
 
-    text = text.replace("\xa0", " ").replace("₽", "руб").lower()
-
-    if "руб" not in text and "rur" not in text:
+    if salary.get("currency") != "RUR":
         return None
 
-    numbers = re.findall(r"\d[\d\s]*", text)
-    numbers = [int(n.replace(" ", "")) for n in numbers if int(n.replace(" ", "")) >= 1000]
+    salary_from = salary.get("from")
+    salary_to = salary.get("to")
 
-    if not numbers:
-        return None
+    if salary_from and salary_to:
+        return (salary_from + salary_to) / 2
 
-    if len(numbers) >= 2:
-        return (numbers[0] + numbers[1]) / 2
+    if salary_from:
+        return salary_from
 
-    value = numbers[0]
+    if salary_to:
+        return salary_to * 0.85
 
-    if "до" in text:
-        return value * 0.85
-
-    return value
+    return None
 
 
+# -------------------------------------------------
+# Session requests
+# -------------------------------------------------
 def get_session():
+
     session = requests.Session()
+
     session.trust_env = False
+
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+        "User-Agent": HH_USER_AGENT,
+        "HH-User-Agent": HH_USER_AGENT,
+        "Accept": "application/json",
     })
+
+    # ---------------------------------------------
+    # PROXY из Streamlit Secrets
+    # ---------------------------------------------
+    proxy = st.secrets.get("PROXY_URL")
+
+    if proxy:
+        session.proxies.update({
+            "http": proxy,
+            "https": proxy,
+        })
+
     return session
 
 
-def fetch_from_hh_page(query, pages=3):
-    session = get_session()
-    vacancies = []
+# -------------------------------------------------
+# Получение вакансий
+# -------------------------------------------------
+def fetch_vacancies(query, max_pages=3):
 
-    for page in range(pages):
-        url = (
-            "https://spb.hh.ru/search/vacancy"
-            f"?text={quote_plus(query)}"
-            f"&area={SPB_AREA_ID}"
-            f"&only_with_salary=true"
-            f"&page={page}"
-        )
+    session = get_session()
+
+    vacancies = []
+    errors = []
+
+    for page in range(max_pages):
+
+        params = {
+            "text": query,
+            "area": SPB_AREA_ID,
+            "only_with_salary": "true",
+            "per_page": 100,
+            "page": page,
+            "search_field": "name",
+        }
 
         try:
-            response = session.get(url, timeout=20)
+
+            response = session.get(
+                HH_API_URL,
+                params=params,
+                timeout=30,
+            )
+
         except Exception as e:
-            st.warning(f"Ошибка соединения по запросу «{query}»: {e}")
+
+            errors.append(
+                f"Ошибка соединения по запросу «{query}»: {e}"
+            )
+
             break
 
+        # -----------------------------------------
+        # Ошибки HH
+        # -----------------------------------------
         if response.status_code != 200:
-            st.warning(f"HH вернул ошибку {response.status_code} по запросу «{query}»")
+
+            body = response.text[:500]
+
+            errors.append(
+                f"HH API вернул {response.status_code} "
+                f"по запросу «{query}». "
+                f"Ответ: {body}"
+            )
+
             break
 
-        soup = BeautifulSoup(response.text, "html.parser")
+        data = response.json()
 
-        cards = soup.select('[data-qa="vacancy-serp__vacancy"]')
+        items = data.get("items", [])
 
-        if not cards:
-            cards = soup.select("div.serp-item")
-
-        if not cards:
+        if not items:
             break
 
-        for card in cards:
-            title_el = card.select_one('[data-qa="serp-item__title"]')
-            salary_el = card.select_one('[data-qa="vacancy-serp__vacancy-compensation"]')
-            employer_el = card.select_one('[data-qa="vacancy-serp__vacancy-employer"]')
+        for item in items:
 
-            title = title_el.get_text(" ", strip=True) if title_el else ""
-            salary_text = salary_el.get_text(" ", strip=True) if salary_el else ""
-            employer = employer_el.get_text(" ", strip=True) if employer_el else ""
+            salary_data = item.get("salary")
 
-            salary_value = parse_salary_text(salary_text)
+            salary_value = normalize_salary(salary_data)
 
-            if salary_value:
-                vacancies.append({
-                    "Вакансия": title,
-                    "Компания": employer,
-                    "Зарплата": salary_value,
-                    "Зарплата текст": salary_text,
-                })
+            if not salary_value:
+                continue
 
-        time.sleep(0.5)
+            vacancies.append({
+                "id": item.get("id", ""),
+                "Вакансия": item.get("name", ""),
+                "Компания": item.get("employer", {}).get("name", ""),
+                "Город": item.get("area", {}).get("name", ""),
+                "Зарплата": salary_value,
+                "Ссылка": item.get("alternate_url", ""),
+                "Запрос": query,
+            })
 
-    return vacancies
+        time.sleep(0.3)
+
+    return vacancies, errors
 
 
-def analyze_category(category, queries):
-    rows = []
+# -------------------------------------------------
+# Анализ категории
+# -------------------------------------------------
+def analyze_category(category_name, queries):
+
+    all_vacancies = []
+    all_errors = []
 
     for query in queries:
-        rows.extend(fetch_from_hh_page(query))
 
-    if not rows:
-        return {
-            "Категория": category,
+        vacancies, errors = fetch_vacancies(query)
+
+        all_vacancies.extend(vacancies)
+        all_errors.extend(errors)
+
+    if not all_vacancies:
+
+        result = {
+            "Категория": category_name,
             "Вакансий": 0,
             "Медиана": None,
             "Средняя": None,
             "Мин": None,
             "Макс": None,
-        }, pd.DataFrame()
+        }
 
-    df = pd.DataFrame(rows)
-    df = df.drop_duplicates(subset=["Вакансия", "Компания", "Зарплата текст"])
+        return result, pd.DataFrame(), all_errors
+
+    df = pd.DataFrame(all_vacancies)
+
+    # удаляем дубли
+    df = df.drop_duplicates(subset=["id"])
 
     salaries = df["Зарплата"]
 
     result = {
-        "Категория": category,
+        "Категория": category_name,
         "Вакансий": len(df),
         "Медиана": salaries.median(),
         "Средняя": salaries.mean(),
@@ -157,11 +271,18 @@ def analyze_category(category, queries):
         "Макс": salaries.max(),
     }
 
-    return result, df
+    return result, df, all_errors
 
 
+# -------------------------------------------------
+# Интерфейс
+# -------------------------------------------------
 st.title("💰 Зарплаты HoReCa СПБ")
-st.caption("Данные собираются с публичной выдачи HH.ru по Санкт-Петербургу")
+
+st.caption(
+    "Данные собираются через HH API "
+    "по Санкт-Петербургу"
+)
 
 st.info(
     "Считаем только вакансии, где указана зарплата. "
@@ -169,25 +290,67 @@ st.info(
     "Если указано только «до» — берем 85% от суммы."
 )
 
-if st.button("🔄 Обновить данные", use_container_width=True):
+with st.expander("⚙️ Диагностика"):
+
+    st.write("Источник: HH API")
+    st.write("Город: Санкт-Петербург")
+    st.write("Area ID:", SPB_AREA_ID)
+    st.write("User-Agent:", HH_USER_AGENT)
+
+    if "PROXY_URL" in st.secrets:
+        st.success("Proxy подключен")
+    else:
+        st.warning("Proxy НЕ подключен")
+
+
+# -------------------------------------------------
+# Кнопка обновления
+# -------------------------------------------------
+if st.button(
+    "🔄 Обновить данные",
+    use_container_width=True
+):
+
     results = []
     details = {}
+    errors_by_category = {}
 
     progress = st.progress(0)
 
     for i, (category, queries) in enumerate(CATEGORIES.items()):
-        result, detail_df = analyze_category(category, queries)
+
+        result, detail_df, errors = analyze_category(
+            category,
+            queries
+        )
 
         results.append(result)
+
         details[category] = detail_df
 
-        progress.progress((i + 1) / len(CATEGORIES))
+        errors_by_category[category] = errors
 
+        progress.progress(
+            (i + 1) / len(CATEGORIES)
+        )
+
+    # ---------------------------------------------
+    # Итоговая таблица
+    # ---------------------------------------------
     result_df = pd.DataFrame(results)
+
     display_df = result_df.copy()
 
-    for col in ["Медиана", "Средняя", "Мин", "Макс"]:
-        display_df[col] = display_df[col].apply(format_money)
+    for col in [
+        "Медиана",
+        "Средняя",
+        "Мин",
+        "Макс"
+    ]:
+
+        display_df[col] = display_df[col].apply(
+            format_money
+        )
 
     st.subheader("Итоговая таблица")
 
@@ -197,16 +360,34 @@ if st.button("🔄 Обновить данные", use_container_width=True):
         hide_index=True,
     )
 
+    # ---------------------------------------------
+    # Детализация
+    # ---------------------------------------------
     st.subheader("Детализация")
 
     for category, detail_df in details.items():
+
         with st.expander(category):
+
             if detail_df.empty:
-                st.write("Вакансии с зарплатой не найдены.")
+
+                st.write(
+                    "Вакансии с зарплатой не найдены."
+                )
+
             else:
+
                 show_df = detail_df.copy()
-                show_df["Зарплата расчет"] = show_df["Зарплата"].apply(format_money)
-                show_df = show_df.drop(columns=["Зарплата"])
+
+                show_df["Зарплата расчет"] = (
+                    show_df["Зарплата"]
+                    .apply(format_money)
+                )
+
+                show_df = show_df.drop(
+                    columns=["Зарплата", "id"],
+                    errors="ignore"
+                )
 
                 st.dataframe(
                     show_df,
@@ -214,7 +395,34 @@ if st.button("🔄 Обновить данные", use_container_width=True):
                     hide_index=True,
                 )
 
-    st.success(f"Обновлено: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}")
+    # ---------------------------------------------
+    # Ошибки
+    # ---------------------------------------------
+    all_errors = []
+
+    for category, errors in errors_by_category.items():
+
+        for err in errors:
+
+            all_errors.append(
+                f"{category}: {err}"
+            )
+
+    if all_errors:
+
+        with st.expander("⚠️ Ошибки HH API"):
+
+            for err in all_errors:
+                st.warning(err)
+
+    st.success(
+        f"Обновлено: "
+        f"{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+    )
 
 else:
-    st.write("Нажмите **Обновить данные**, чтобы получить свежую статистику.")
+
+    st.write(
+        "Нажмите **Обновить данные**, "
+        "чтобы получить свежую статистику."
+    )
